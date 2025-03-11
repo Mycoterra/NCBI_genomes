@@ -1,117 +1,168 @@
 #!/usr/bin/env python
+import os
 import time
 import csv
-from Bio import Entrez
+import requests
+from Bio import Entrez, SeqIO
 
-# --- Configuration ---
-Entrez.email = "cathalmeehan3@gmail.com"
+# ================================
+# Configuration
+# ================================
+Entrez.email = "cathalmeehan3@gmail.com"  # Your NCBI email
+metadata_csv = "ncbi_amf_assembly_details.csv"  # CSV file with assembly metadata
+download_dir = "/Volumes/Elements/Assembly"  # Directory to save downloaded files
+chunks_dir = os.path.join(download_dir, "Chunks")  # Directory for processed sequence chunks
+combined_chunks_file = "fungal_chunks.txt"  # Final combined training file
+chunk_size = 512  # Chunk size in bp
+sleep_interval = 0.5  # Pause between downloads (seconds)
 
-# List of modern AM fungal genera to search
-genus_list = [
-    "Acaulospora", "Ambispora", "Archaeospora", "Cetraspora",
-    "Claroideoglomus", "Corymbiglomus", "Dentiscutata", "Diversispora",
-    "Dominikia", "Funneliformis", "Gigaspora", "Glomus",
-    "Kamienskia", "Lucioglomus", "Pacispora", "Paraglomus",
-    "Racocetra", "Redeckera", "Rhizophagus", "Scutellospora",
-    "Sclerocystis", "Septoglomus", "Simiglomus"
-]
+# Create directories if they don't exist
+for d in [download_dir, chunks_dir]:
+    if not os.path.exists(d):
+        os.makedirs(d)
 
-# Containers for metadata records
-assembly_rows = []
-transcriptome_rows = []
 
-# --- Part 1: Retrieve Metadata from NCBI ---
-for genus in genus_list:
-    print(f"Processing genus: {genus}")
-
-    # 1A. Assembly Search
-    assembly_query = f'"{genus}"[Organism]'
+# ================================
+# Functions
+# ================================
+def download_file_with_suffix(assembly_accession, assembly_name, file_suffix, out_filepath):
+    """
+    Downloads a file for a given assembly using a specified suffix.
+    The function first attempts to retrieve the FTP path via esummary (with validate=False);
+    if that fails, it constructs the FTP URL manually. Then it converts the URL from ftp:// to https://.
+    Returns True if download succeeds, False otherwise.
+    """
+    ftp_path = ""
     try:
-        handle = Entrez.esearch(db="assembly", term=assembly_query, retmax=100)
-        assembly_record = Entrez.read(handle)
+        # Attempt to retrieve the assembly summary (skip DTD validation)
+        handle = Entrez.esummary(db="assembly", id=assembly_accession)
+        summary = Entrez.read(handle, validate=False)
         handle.close()
-        assembly_ids = assembly_record.get("IdList", [])
-        print(f"  Found {len(assembly_ids)} assembly record(s).")
+        docs = summary.get("DocumentSummarySet", {}).get("DocumentSummary", [])
+        if docs:
+            detail = docs[0]
+            ftp_path = detail.get("FtpPath_GenBank", "") or detail.get("FtpPath_RefSeq", "")
     except Exception as e:
-        print(f"  Error searching assembly for {genus}: {e}")
-        assembly_ids = []
+        print(f"Error retrieving esummary for {assembly_accession}: {e}")
 
-    # Retrieve metadata for each assembly
-    for aid in assembly_ids:
+    if ftp_path:
+        folder_name = ftp_path.rstrip("/").split("/")[-1]
+    else:
+        # Fallback: manually construct the FTP path using the accession and assembly name.
         try:
-            handle = Entrez.esummary(db="assembly", id=aid)
-            summary = Entrez.read(handle)
-            handle.close()
-            detail = summary["DocumentSummarySet"]["DocumentSummary"][0]
-            assembly_rows.append({
-                "Genus": genus,
-                "AssemblyID": aid,
-                "AssemblyAccession": detail.get("AssemblyAccession", ""),
-                "Organism": detail.get("Organism", ""),
-                "SpeciesName": detail.get("SpeciesName", ""),
-                "AssemblyName": detail.get("AssemblyName", ""),
-                "AssemblyStatus": detail.get("AssemblyStatus", ""),
-                "SubmitDate": detail.get("SubmitDate", ""),
-                "Version": detail.get("Version", "")
-            })
+            parts = assembly_accession.split("_")
+            prefix = parts[0]  # e.g. "GCA"
+            digits = parts[1].split(".")[0]  # e.g. "910592055"
+            d1, d2, d3 = digits[0:3], digits[3:6], digits[6:9]
         except Exception as e:
-            print(f"  Error retrieving summary for assembly {aid} for {genus}: {e}")
-        time.sleep(0.3)
-    time.sleep(1)
+            print(f"Error parsing accession {assembly_accession}: {e}")
+            return False
+        folder_name = f"{assembly_accession}_{assembly_name}"
+        ftp_path = f"ftp://ftp.ncbi.nlm.nih.gov/genomes/all/{prefix}/{d1}/{d2}/{d3}/{folder_name}"
 
-    # 1B. Transcriptome Search
-    tsa_query = f'"{genus}"[Organism] AND "transcriptome shotgun assembly"[Title]'
+    filename = f"{folder_name}{file_suffix}"
+    # Convert the FTP URL to HTTPS so that requests can handle it.
+    if ftp_path.lower().startswith("ftp://"):
+        https_path = "https://" + ftp_path[6:]
+    else:
+        https_path = ftp_path
+    download_url = https_path + "/" + filename
+    print(f"Downloading {assembly_accession} file:\n  {filename}\n  {download_url}")
+
     try:
-        handle = Entrez.esearch(db="nuccore", term=tsa_query, retmax=100)
-        transcriptome_record = Entrez.read(handle)
-        handle.close()
-        transcriptome_ids = transcriptome_record.get("IdList", [])
-        print(f"  Found {len(transcriptome_ids)} transcriptome record(s).")
+        response = requests.get(download_url, stream=True, timeout=60)
+        if response.status_code == 200:
+            with open(out_filepath, "wb") as out_file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        out_file.write(chunk)
+            print(f"Downloaded {assembly_accession} file {filename} to {out_filepath}")
+            return True
+        else:
+            print(f"Error downloading {assembly_accession}: HTTP {response.status_code}")
+            return False
     except Exception as e:
-        print(f"  Error searching transcriptome for {genus}: {e}")
-        transcriptome_ids = []
+        print(f"Error processing {assembly_accession}: {e}")
+        return False
 
-    # Retrieve metadata for each transcriptome record
-    for tid in transcriptome_ids:
-        try:
-            handle = Entrez.esearch(db="nuccore", term=tsa_query, retmax=100)
-            transcriptome_record = Entrez.read(handle)
-            handle.close()
-            # Using esummary on the first record
-            handle = Entrez.esummary(db="nuccore", id=tid)
-            summary = Entrez.read(handle)
-            handle.close()
-            detail = summary[0]
-            transcriptome_rows.append({
-                "Genus": genus,
-                "TranscriptomeID": tid,
-                "Accession": detail.get("AccessionVersion", ""),
-                "Title": detail.get("Title", ""),
-                "Organism": detail.get("Organism", ""),
-                "ReleaseDate": detail.get("ReleaseDate", "")
-            })
-        except Exception as e:
-            print(f"  Error retrieving summary for transcriptome {tid} for {genus}: {e}")
-        time.sleep(0.3)
-    time.sleep(1)
 
-# --- Save Metadata to CSV Files ---
-assembly_output_file = "ncbi_amf_assembly_details.csv"
-with open(assembly_output_file, mode="w", newline="") as csvfile:
-    fieldnames = ["Genus", "AssemblyID", "AssemblyAccession", "Organism",
-                  "SpeciesName", "AssemblyName", "AssemblyStatus", "SubmitDate", "Version"]
-    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-    writer.writeheader()
-    for row in assembly_rows:
-        writer.writerow(row)
+def process_fasta_to_chunks(fasta_filepath, chunk_size, chunks_output_dir):
+    """
+    Processes a gzipped FASTA file by splitting each sequence into fixed-length chunks.
+    Each chunk is written as a line in an output text file.
+    If the chunk file already exists, it is reused.
+    Returns the path to the generated chunks file, or None on error.
+    """
+    base_name = os.path.basename(fasta_filepath).replace("_genomic.fna.gz", "")
+    chunks_file = os.path.join(chunks_output_dir, f"{base_name}_chunks.txt")
 
-transcriptome_output_file = "ncbi_amf_transcriptome_details.csv"
-with open(transcriptome_output_file, mode="w", newline="") as csvfile:
-    fieldnames = ["Genus", "TranscriptomeID", "Accession", "Title", "Organism", "ReleaseDate"]
-    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-    writer.writeheader()
-    for row in transcriptome_rows:
-        writer.writerow(row)
+    if os.path.exists(chunks_file):
+        print(f"Chunks file for {base_name} already exists, skipping processing.")
+        return chunks_file
 
-print(f"\nAssembly details written to {assembly_output_file}")
-print(f"Transcriptome details written to {transcriptome_output_file}")
+    chunk_count = 0
+    import gzip
+    try:
+        with gzip.open(fasta_filepath, "rt") as handle, open(chunks_file, "w") as out_f:
+            for record in SeqIO.parse(handle, "fasta"):
+                seq = str(record.seq).upper()
+                for i in range(0, len(seq) - chunk_size + 1, chunk_size):
+                    chunk = seq[i:i + chunk_size]
+                    out_f.write(chunk + "\n")
+                    chunk_count += 1
+        print(f"Processed {fasta_filepath}: {chunk_count} chunks saved to {chunks_file}")
+    except Exception as e:
+        print(f"Error processing {fasta_filepath}: {e}")
+        return None
+
+    return chunks_file
+
+
+# ================================
+# Pipeline: Download and Process Assemblies and Annotations
+# ================================
+all_chunks_files = []
+
+with open(metadata_csv, mode="r", newline="") as infile:
+    reader = csv.DictReader(infile)
+    for row in reader:
+        assembly_acc = row.get("AssemblyAccession", "").strip()
+        assembly_name = row.get("AssemblyName", "").strip()
+        if assembly_acc and assembly_name:
+            # Define output paths for genomic FASTA and annotation (GFF) files.
+            fasta_out_path = os.path.join(download_dir, f"{assembly_acc}.fna.gz")
+            gff_out_path = os.path.join(download_dir, f"{assembly_acc}.gff.gz")
+
+            # Download FASTA if not already present.
+            if os.path.exists(fasta_out_path):
+                print(f"{assembly_acc} FASTA already downloaded, skipping download.")
+            else:
+                success = download_file_with_suffix(assembly_acc, assembly_name, "_genomic.fna.gz", fasta_out_path)
+                if not success:
+                    continue  # Skip processing if download fails
+                time.sleep(sleep_interval)
+
+            # Download Annotation (GFF) if not already present.
+            if os.path.exists(gff_out_path):
+                print(f"{assembly_acc} GFF annotation already downloaded, skipping download.")
+            else:
+                success = download_file_with_suffix(assembly_acc, assembly_name, "_genomic.gff.gz", gff_out_path)
+                if not success:
+                    print(f"Annotation download failed for {assembly_acc}.")
+                time.sleep(sleep_interval)
+
+            # Process FASTA into chunks if not already done.
+            chunks_file = process_fasta_to_chunks(fasta_out_path, chunk_size, chunks_dir)
+            if chunks_file:
+                all_chunks_files.append(chunks_file)
+        else:
+            print("Missing AssemblyAccession or AssemblyName in row, skipping.")
+
+# ================================
+# Combine All Chunk Files into a Single Training File
+# ================================
+with open(combined_chunks_file, "w") as outfile:
+    for cf in all_chunks_files:
+        with open(cf, "r") as infile:
+            outfile.write(infile.read())
+print(f"\nAll chunks combined into {combined_chunks_file}")
