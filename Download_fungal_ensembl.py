@@ -1,11 +1,12 @@
+#!/usr/bin/env python
 import time
 import csv
 from Bio import Entrez
 
-# Set your email address (required by NCBI)
+# --- Configuration ---
 Entrez.email = "cathalmeehan3@gmail.com"
 
-# List of modern AM fungal genera
+# List of modern AM fungal genera to search
 genus_list = [
     "Acaulospora", "Ambispora", "Archaeospora", "Cetraspora",
     "Claroideoglomus", "Corymbiglomus", "Dentiscutata", "Diversispora",
@@ -15,15 +16,15 @@ genus_list = [
     "Sclerocystis", "Septoglomus", "Simiglomus"
 ]
 
-# Containers for detailed records
+# Containers for metadata records
 assembly_rows = []
 transcriptome_rows = []
 
+# --- Part 1: Retrieve Metadata from NCBI ---
 for genus in genus_list:
     print(f"Processing genus: {genus}")
-    # -------------------------------
-    # 1. Search NCBI Assembly database for assemblies
-    # -------------------------------
+
+    # 1A. Assembly Search
     assembly_query = f'"{genus}"[Organism]'
     try:
         handle = Entrez.esearch(db="assembly", term=assembly_query, retmax=100)
@@ -41,7 +42,6 @@ for genus in genus_list:
             handle = Entrez.esummary(db="assembly", id=aid)
             summary = Entrez.read(handle)
             handle.close()
-            # The summary structure is nested; we extract the first document summary.
             detail = summary["DocumentSummarySet"]["DocumentSummary"][0]
             assembly_rows.append({
                 "Genus": genus,
@@ -56,12 +56,10 @@ for genus in genus_list:
             })
         except Exception as e:
             print(f"  Error retrieving summary for assembly {aid} for {genus}: {e}")
-        time.sleep(0.3)  # small delay between requests
+        time.sleep(0.3)
     time.sleep(1)
 
-    # -------------------------------
-    # 2. Search NCBI Nucleotide database for transcriptome shotgun assemblies (TSA)
-    # -------------------------------
+    # 1B. Transcriptome Search
     tsa_query = f'"{genus}"[Organism] AND "transcriptome shotgun assembly"[Title]'
     try:
         handle = Entrez.esearch(db="nuccore", term=tsa_query, retmax=100)
@@ -76,10 +74,13 @@ for genus in genus_list:
     # Retrieve metadata for each transcriptome record
     for tid in transcriptome_ids:
         try:
+            handle = Entrez.esearch(db="nuccore", term=tsa_query, retmax=100)
+            transcriptome_record = Entrez.read(handle)
+            handle.close()
+            # Using esummary on the first record
             handle = Entrez.esummary(db="nuccore", id=tid)
             summary = Entrez.read(handle)
             handle.close()
-            # esummary for nuccore typically returns a list of document summaries
             detail = summary[0]
             transcriptome_rows.append({
                 "Genus": genus,
@@ -94,9 +95,7 @@ for genus in genus_list:
         time.sleep(0.3)
     time.sleep(1)
 
-# -------------------------------
-# Write the detailed assembly metadata to a CSV file
-# -------------------------------
+# --- Save Metadata to CSV Files ---
 assembly_output_file = "ncbi_amf_assembly_details.csv"
 with open(assembly_output_file, mode="w", newline="") as csvfile:
     fieldnames = ["Genus", "AssemblyID", "AssemblyAccession", "Organism",
@@ -106,9 +105,6 @@ with open(assembly_output_file, mode="w", newline="") as csvfile:
     for row in assembly_rows:
         writer.writerow(row)
 
-# -------------------------------
-# Write the detailed transcriptome metadata to a CSV file
-# -------------------------------
 transcriptome_output_file = "ncbi_amf_transcriptome_details.csv"
 with open(transcriptome_output_file, mode="w", newline="") as csvfile:
     fieldnames = ["Genus", "TranscriptomeID", "Accession", "Title", "Organism", "ReleaseDate"]
